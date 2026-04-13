@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 3000;
 // ── Configuration ──
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
+const ANTHROPIC_MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 1024;
 
 // System prompt — edit this to change the chatbot's personality
@@ -134,36 +134,63 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: MAX_TOKENS,
-        system: SYSTEM_PROMPT,
-        messages: messages,
-      }),
-    });
+  // Retry logic — retry up to 3 times on transient 529 (overloaded) errors
+  const MAX_RETRIES = 3;
+  let lastError = null;
 
-    if (!response.ok) {
-      const errBody = await response.json().catch(() => ({}));
-      const msg = errBody?.error?.message || `Anthropic API error (${response.status})`;
-      return res.status(response.status).json({ error: msg });
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      // Exponential backoff: 0ms, 1000ms, 2000ms
+      if (attempt > 0) {
+        const delay = attempt * 1000;
+        console.log(`Retry attempt ${attempt} after ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: ANTHROPIC_MODEL,
+          max_tokens: MAX_TOKENS,
+          system: SYSTEM_PROMPT,
+          messages: messages,
+        }),
+      });
+
+      // If overloaded (529), retry
+      if (response.status === 529) {
+        const errBody = await response.json().catch(() => ({}));
+        lastError = errBody?.error?.message || "Service is temporarily busy.";
+        console.warn(`Anthropic API overloaded (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue; // retry
+      }
+
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        const msg = errBody?.error?.message || `Anthropic API error (${response.status})`;
+        return res.status(response.status).json({ error: msg });
+      }
+
+      const data = await response.json();
+      const reply = data.content?.[0]?.text || "";
+
+      return res.json({ reply });
+    } catch (err) {
+      console.error(`Proxy error (attempt ${attempt + 1}):`, err);
+      lastError = "Failed to reach the AI service.";
     }
-
-    const data = await response.json();
-    const reply = data.content?.[0]?.text || "";
-
-    res.json({ reply });
-  } catch (err) {
-    console.error("Proxy error:", err);
-    res.status(500).json({ error: "Failed to reach the AI service." });
   }
+
+  // All retries exhausted
+  console.error("All retries exhausted for Anthropic API call.");
+  res.status(529).json({
+    error: "Our AI assistant is temporarily busy. Please try again in a moment.",
+  });
 });
 
 // ── Start ──
